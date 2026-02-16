@@ -299,6 +299,7 @@ def load_data(data_dir, icustays_path=None, target_subjects=None):
                 continue
 
             sub_stays = icu_stays[icu_stays['subject_id'] == sub]
+            sub_stays = sub_stays.dropna(subset=['los'])
             if sub_stays.empty:
                 patients_skipped += 1
                 continue
