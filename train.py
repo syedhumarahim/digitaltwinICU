@@ -206,8 +206,8 @@ def load_data(data_dir, target_subjects=None):
         data_dir: directory containing parquet files and icustays2.csv
         target_subjects: max subjects to load (None = ALL)
     """
-    parquet_dir = os.path.join(data_dir, 'mimic_iv_parquet_files')
-    icustays_path = os.path.join(data_dir, 'icustays2.csv')
+    parquet_dir = '/hpc/group/kamaleswaranlab/capstone_icu_digital_twins/meds/MIMIC-IV_Example/data/MEDS_COHORT/data/train'
+    icustays_path = '/hpc/group/kamaleswaranlab/state-space-Digital-Twin/icustays2.csv'
 
     files = sorted(glob.glob(os.path.join(parquet_dir, '*.parquet')))
     if not files:
