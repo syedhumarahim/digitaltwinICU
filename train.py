@@ -198,12 +198,14 @@ def collate_fn(batch):
 # 5. Data Loading
 # ============================================================
 
-def load_data(data_dir, target_subjects=None):
+def load_data(data_dir, icustays_path=None, target_subjects=None):
     """
-    Load MIMIC-IV parquet data.
+    Load MIMIC-IV parquet data — MEMORY-EFFICIENT streaming version.
+    Processes one parquet file at a time instead of loading all into RAM.
 
     Args:
-        data_dir: directory containing parquet files and icustays2.csv
+        data_dir: directory containing .parquet files (directly)
+        icustays_path: path to icustays2.csv (if None, looks in data_dir)
         target_subjects: max subjects to load (None = ALL)
     """
     parquet_dir = '/hpc/group/kamaleswaranlab/capstone_icu_digital_twins/meds/MIMIC-IV_Example/data/MEDS_COHORT/data/train'
@@ -211,7 +213,14 @@ def load_data(data_dir, target_subjects=None):
 
     files = sorted(glob.glob(os.path.join(parquet_dir, '*.parquet')))
     if not files:
-        raise FileNotFoundError(f"No .parquet files in {parquet_dir}")
+        raise FileNotFoundError(f"No .parquet files in {data_dir} or {data_dir}/mimic_iv_parquet_files/")
+
+    # Find icustays
+    if icustays_path is None:
+        icustays_path = os.path.join(data_dir, 'icustays2.csv')
+        if not os.path.exists(icustays_path):
+            # Check parent directory too
+            icustays_path = os.path.join(os.path.dirname(data_dir), 'icustays2.csv')
 
     label = f"{target_subjects}" if target_subjects else "ALL"
     print(f"{'='*70}")
@@ -219,6 +228,7 @@ def load_data(data_dir, target_subjects=None):
     print(f"{'='*70}")
     print(f"  Data dir: {data_dir}")
     print(f"  Parquet files: {len(files)}")
+    print(f"  ICU stays file: {icustays_path}")
     print(f"  Resampling: {RESAMPLE_FREQ} bins using .last()")
     print(f"  Window: {CONTEXT_STEPS} ctx + {HORIZON_STEPS} tgt = {TOTAL_STEPS} steps")
     print(f"  Input dims: {INPUT_DIM}*3 + {TREAT_DIM} = {INPUT_DIM*3+TREAT_DIM}")
@@ -229,143 +239,162 @@ def load_data(data_dir, target_subjects=None):
     icu_subject_ids = set(icu_stays['subject_id'].unique())
     print(f"  ICU stays: {len(icu_stays)} from {len(icu_subject_ids)} patients")
 
-    # Load events
-    print(f"\n1⃣  Loading subjects...")
-    collected_dfs = []
-    unique_subjects = set()
-
-    for f in files:
-        if target_subjects and len(unique_subjects) >= target_subjects:
-            break
-        df = pd.read_parquet(f)
-        df = df[df['code'].isin(VITAL_FEATURES + TREATMENT_FEATURES)]
-        df = df[df['subject_id'].isin(icu_subject_ids)]
-        collected_dfs.append(df)
-        unique_subjects.update(df['subject_id'].unique())
-        if len(collected_dfs) % 10 == 0:
-            print(f"   ... {len(collected_dfs)} files, {len(unique_subjects)} subjects")
-
-    df_all = pd.concat(collected_dfs, ignore_index=True)
-    df_all['time'] = pd.to_datetime(df_all['time'])
-
-    if target_subjects:
-        final_subjects = list(unique_subjects)[:target_subjects]
-    else:
-        final_subjects = list(unique_subjects)
-    df_all = df_all[df_all['subject_id'].isin(final_subjects)]
-    print(f"   ✓ {len(final_subjects)} subjects, {len(df_all):,} events")
-
-    # Pivot
-    df_numeric = df_all[df_all['code'].isin(VITAL_FEATURES)]
-    df_events = df_all[df_all['code'].isin(TREATMENT_FEATURES)]
-
-    df_x = df_numeric.pivot_table(index=['subject_id', 'time'],
-                                   columns='code', values='numeric_value')
-    df_events_copy = df_events.copy()
-    df_events_copy['event'] = 1
-    df_a = df_events_copy.pivot_table(index=['subject_id', 'time'],
-                                       columns='code', values='event', aggfunc='max')
-
-    del df_all, df_numeric, df_events, df_events_copy, collected_dfs
-    gc.collect()
-
-    # Process patients → windows
-    print(f"\n2⃣  Processing patients → windows...")
+    # ---- STREAMING: Process one parquet file at a time ----
+    print(f"\n1⃣  Streaming parquet files (one at a time)...")
     all_windows = []
     patients_processed = 0
     patients_skipped = 0
+    subjects_seen = set()
     MAX_STEPS = 100
 
-    for sub in final_subjects:
-        if sub not in df_x.index:
-            patients_skipped += 1
+    for fi, fpath in enumerate(files):
+        if target_subjects and len(subjects_seen) >= target_subjects:
+            break
+
+        # Load ONE file
+        df = pd.read_parquet(fpath)
+        df = df[df['code'].isin(VITAL_FEATURES + TREATMENT_FEATURES)]
+        df = df[df['subject_id'].isin(icu_subject_ids)]
+        df['time'] = pd.to_datetime(df['time'])
+
+        if target_subjects:
+            # Only keep subjects we haven't seen yet, up to the limit
+            new_subs = set(df['subject_id'].unique()) - subjects_seen
+            remaining = target_subjects - len(subjects_seen)
+            keep_subs = set(list(new_subs)[:remaining]) | (set(df['subject_id'].unique()) & subjects_seen)
+            df = df[df['subject_id'].isin(keep_subs)]
+
+        file_subjects = set(df['subject_id'].unique())
+        subjects_seen.update(file_subjects)
+
+        if df.empty:
             continue
 
-        sub_stays = icu_stays[icu_stays['subject_id'] == sub]
-        if sub_stays.empty:
-            patients_skipped += 1
+        # Pivot THIS file's data
+        df_numeric = df[df['code'].isin(VITAL_FEATURES)]
+        df_events = df[df['code'].isin(TREATMENT_FEATURES)]
+
+        if df_numeric.empty:
             continue
 
-        longest = sub_stays.loc[sub_stays['los'].idxmax()]
-        icu_in, icu_out = longest['intime'], longest['outtime']
-
-        sub_data = df_x.loc[sub]
-        sub_data = sub_data[(sub_data.index >= icu_in) & (sub_data.index <= icu_out)]
-        if sub_data.empty:
-            patients_skipped += 1
-            continue
-
-        x_raw = sub_data.resample(RESAMPLE_FREQ).last()
-        x_raw = x_raw.reindex(columns=VITAL_FEATURES, fill_value=np.nan)
-
-        if len(x_raw) > MAX_STEPS:
-            x_raw = x_raw.iloc[:MAX_STEPS]
-        if len(x_raw) < TOTAL_STEPS:
-            patients_skipped += 1
-            continue
-
-        obs_mask = (~x_raw.isna()).astype(float)
-
-        # Delta_t
-        delta_t = pd.DataFrame(0.0, index=x_raw.index, columns=VITAL_FEATURES)
-        for col in VITAL_FEATURES:
-            last_obs_idx = None
-            dt_col = []
-            for idx, val in enumerate(x_raw[col].values):
-                if pd.notna(val):
-                    dt_col.append(0.0)
-                    last_obs_idx = idx
-                else:
-                    dt_col.append(float(idx - last_obs_idx) if last_obs_idx is not None else 999.0)
-            delta_t[col] = dt_col
-
-        # Per-patient normalization
-        x_mean = x_raw.mean(skipna=True)
-        x_std = x_raw.std(skipna=True) + 1e-6
-        x_norm = (x_raw - x_mean) / x_std
-        x_norm_filled = x_norm.fillna(0.0)
-
-        # Treatments
-        if sub in df_a.index:
-            a = df_a.loc[sub].resample(RESAMPLE_FREQ).max().fillna(0)
-            a = a.reindex(x_raw.index, fill_value=0)
+        df_x = df_numeric.pivot_table(index=['subject_id', 'time'],
+                                       columns='code', values='numeric_value')
+        if not df_events.empty:
+            df_events_c = df_events.copy()
+            df_events_c['event'] = 1
+            df_a = df_events_c.pivot_table(index=['subject_id', 'time'],
+                                           columns='code', values='event', aggfunc='max')
+            del df_events_c
         else:
-            a = pd.DataFrame(0, index=x_raw.index, columns=TREATMENT_FEATURES)
-        a = a.reindex(columns=TREATMENT_FEATURES, fill_value=0)
+            df_a = pd.DataFrame()
 
-        # Tensors
-        x_raw_filled = x_raw.fillna(0.0)
-        x_raw_tensor = torch.tensor(x_raw_filled.values, dtype=torch.float32)
-        x_tensor = torch.tensor(x_norm_filled.values, dtype=torch.float32)
-        mask_tensor = torch.tensor(obs_mask.values, dtype=torch.float32)
-        dt_tensor = torch.tensor(delta_t.values, dtype=torch.float32).clamp(0, 999)
-        a_tensor = torch.tensor(a.values, dtype=torch.float32)
+        del df, df_numeric, df_events
+        gc.collect()
 
-        # Windows
-        T = len(x_tensor)
-        for start in range(0, T - TOTAL_STEPS + 1, STRIDE_STEPS):
-            end = start + TOTAL_STEPS
-            ctx_end = start + CONTEXT_STEPS
-            tgt_mask = mask_tensor[ctx_end:end]
-            if tgt_mask.sum() < 3:
+        # Process each subject from THIS file
+        for sub in file_subjects:
+            if sub not in df_x.index:
+                patients_skipped += 1
                 continue
 
-            window = {
-                'x_full': x_tensor[start:end],
-                'mask_full': mask_tensor[start:end],
-                'dt_full': dt_tensor[start:end],
-                'a_full': a_tensor[start:end],
-                'target_mask': tgt_mask,
-                'x_raw_full': x_raw_tensor[start:end],
-                'subject_id': sub,
-                'norm_params': {'mean': x_mean.values, 'std': x_std.values},
-            }
-            if not torch.isnan(window['x_full']).any():
-                all_windows.append(window)
+            sub_stays = icu_stays[icu_stays['subject_id'] == sub]
+            if sub_stays.empty:
+                patients_skipped += 1
+                continue
 
-        patients_processed += 1
-        if patients_processed % 100 == 0:
-            print(f"   ... {patients_processed} patients → {len(all_windows)} windows")
+            longest = sub_stays.loc[sub_stays['los'].idxmax()]
+            icu_in, icu_out = longest['intime'], longest['outtime']
+
+            sub_data = df_x.loc[sub]
+            if isinstance(sub_data, pd.Series):
+                # Only one row for this subject
+                patients_skipped += 1
+                continue
+            sub_data = sub_data[(sub_data.index >= icu_in) & (sub_data.index <= icu_out)]
+            if sub_data.empty:
+                patients_skipped += 1
+                continue
+
+            x_raw = sub_data.resample(RESAMPLE_FREQ).last()
+            x_raw = x_raw.reindex(columns=VITAL_FEATURES, fill_value=np.nan)
+
+            if len(x_raw) > MAX_STEPS:
+                x_raw = x_raw.iloc[:MAX_STEPS]
+            if len(x_raw) < TOTAL_STEPS:
+                patients_skipped += 1
+                continue
+
+            obs_mask = (~x_raw.isna()).astype(float)
+
+            # Delta_t
+            delta_t = pd.DataFrame(0.0, index=x_raw.index, columns=VITAL_FEATURES)
+            for col in VITAL_FEATURES:
+                last_obs_idx = None
+                dt_col = []
+                for idx_i, val in enumerate(x_raw[col].values):
+                    if pd.notna(val):
+                        dt_col.append(0.0)
+                        last_obs_idx = idx_i
+                    else:
+                        dt_col.append(float(idx_i - last_obs_idx) if last_obs_idx is not None else 999.0)
+                delta_t[col] = dt_col
+
+            # Per-patient normalization
+            x_mean = x_raw.mean(skipna=True)
+            x_std = x_raw.std(skipna=True) + 1e-6
+            x_norm = (x_raw - x_mean) / x_std
+            x_norm_filled = x_norm.fillna(0.0)
+
+            # Treatments
+            if not df_a.empty and sub in df_a.index:
+                a = df_a.loc[sub]
+                if isinstance(a, pd.Series):
+                    a = a.to_frame().T
+                a = a.resample(RESAMPLE_FREQ).max().fillna(0)
+                a = a.reindex(x_raw.index, fill_value=0)
+            else:
+                a = pd.DataFrame(0, index=x_raw.index, columns=TREATMENT_FEATURES)
+            a = a.reindex(columns=TREATMENT_FEATURES, fill_value=0)
+
+            # Tensors
+            x_raw_filled = x_raw.fillna(0.0)
+            x_raw_tensor = torch.tensor(x_raw_filled.values, dtype=torch.float32)
+            x_tensor = torch.tensor(x_norm_filled.values, dtype=torch.float32)
+            mask_tensor = torch.tensor(obs_mask.values, dtype=torch.float32)
+            dt_tensor = torch.tensor(delta_t.values, dtype=torch.float32).clamp(0, 999)
+            a_tensor = torch.tensor(a.values, dtype=torch.float32)
+
+            # Windows
+            T = len(x_tensor)
+            for start in range(0, T - TOTAL_STEPS + 1, STRIDE_STEPS):
+                end = start + TOTAL_STEPS
+                ctx_end = start + CONTEXT_STEPS
+                tgt_mask = mask_tensor[ctx_end:end]
+                if tgt_mask.sum() < 3:
+                    continue
+
+                window = {
+                    'x_full': x_tensor[start:end],
+                    'mask_full': mask_tensor[start:end],
+                    'dt_full': dt_tensor[start:end],
+                    'a_full': a_tensor[start:end],
+                    'target_mask': tgt_mask,
+                    'x_raw_full': x_raw_tensor[start:end],
+                    'subject_id': sub,
+                    'norm_params': {'mean': x_mean.values, 'std': x_std.values},
+                }
+                if not torch.isnan(window['x_full']).any():
+                    all_windows.append(window)
+
+            patients_processed += 1
+
+        # Clean up this file's data
+        del df_x, df_a
+        gc.collect()
+
+        if (fi + 1) % 5 == 0:
+            print(f"   ... {fi+1}/{len(files)} files, {len(subjects_seen)} subjects, "
+                  f"{patients_processed} processed → {len(all_windows)} windows")
 
     # Stats
     avg_obs = 0.0
@@ -676,6 +705,8 @@ def main():
     parser.add_argument('--lambda_hawkes', type=float, default=0.01)
     parser.add_argument('--cdsp_warmup', type=int, default=3)
     parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--icustays', type=str, default=None,
+                        help='Path to icustays2.csv (auto-detect if None)')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -701,7 +732,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    all_windows = load_data(args.data_dir, args.subjects)
+    all_windows = load_data(args.data_dir, args.icustays, args.subjects)
     if not all_windows:
         print("ERROR: No windows extracted.")
         return
