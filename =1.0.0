@@ -1,0 +1,7 @@
+Collecting causal-conv1d
+  Using cached causal_conv1d-1.6.0.tar.gz (29 kB)
+  Installing build dependencies: started
+  Installing build dependencies: still running...
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'error'

@@ -208,11 +208,10 @@ def load_data(data_dir, icustays_path=None, target_subjects=None):
         icustays_path: path to icustays2.csv (if None, looks in data_dir)
         target_subjects: max subjects to load (None = ALL)
     """
-    # Find parquet files — check data_dir directly first, then subdirectory
-    files = sorted(glob.glob(os.path.join(data_dir, '*.parquet')))
-    if not files:
-        subdir = os.path.join(data_dir, 'mimic_iv_parquet_files')
-        files = sorted(glob.glob(os.path.join(subdir, '*.parquet')))
+    parquet_dir = '/hpc/group/kamaleswaranlab/capstone_icu_digital_twins/meds/MIMIC-IV_Example/data/MEDS_COHORT/data/train'
+    icustays_path = '/hpc/group/kamaleswaranlab/state-space-Digital-Twin/icustays2.csv'
+
+    files = sorted(glob.glob(os.path.join(parquet_dir, '*.parquet')))
     if not files:
         raise FileNotFoundError(f"No .parquet files in {data_dir} or {data_dir}/mimic_iv_parquet_files/")
 

@@ -33,3 +33,8 @@ Thumbs.db
 eda_results*/
 mamba-ssm-macos/
 *.ipynb
+mamba/
+twin_env/
+twin_env_group/
+tmp_build/
+clean_build_dir/
